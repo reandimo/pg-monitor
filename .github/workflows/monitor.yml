@@ -1,0 +1,129 @@
+name: Psilly Goose Funnel Monitor
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # smoke every 15 min
+    - cron: "*/30 * * * *"   # full e2e every 30 min
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Decide scope
+        id: scope
+        run: |
+          if [[ "${{ github.event.schedule }}" == "*/15 * * * *" ]]; then
+            echo "grep=smoke" >> $GITHUB_OUTPUT
+          else
+            echo "grep=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run tests
+        id: pw
+        continue-on-error: true
+        run: |
+          rm -f failures.log cf-failures.log
+          if [[ -n "${{ steps.scope.outputs.grep }}" ]]; then
+            npx playwright test --grep "${{ steps.scope.outputs.grep }}"
+          else
+            npx playwright test
+          fi
+
+      - name: Debounce — re-run after CF challenge cooldown
+        id: pw-retry
+        if: steps.pw.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          sleep 90
+          rm -f results.json failures.log cf-failures.log
+          if [[ -n "${{ steps.scope.outputs.grep }}" ]]; then
+            npx playwright test --grep "${{ steps.scope.outputs.grep }}"
+          else
+            npx playwright test
+          fi
+
+      - name: Classify failure (real vs Cloudflare-only)
+        id: classify
+        if: steps.pw.outcome == 'failure' && steps.pw-retry.outcome == 'failure'
+        run: |
+          total=0
+          cf=0
+          [ -f failures.log ] && total=$(wc -l < failures.log | tr -d ' ')
+          [ -f cf-failures.log ] && cf=$(wc -l < cf-failures.log | tr -d ' ')
+          echo "total_failures=$total" >> $GITHUB_OUTPUT
+          echo "cf_failures=$cf" >> $GITHUB_OUTPUT
+          if [ "$total" -gt 0 ] && [ "$total" = "$cf" ]; then
+            echo "all_cf=true" >> $GITHUB_OUTPUT
+            echo "::notice::All $total failures were Cloudflare bot challenges. Skipping Slack alert."
+          else
+            echo "all_cf=false" >> $GITHUB_OUTPUT
+            echo "::notice::Failures: $total total, $cf classified as Cloudflare. Diagnose will run."
+          fi
+
+      - name: Diagnose with Claude
+        id: diag
+        if: steps.pw.outcome == 'failure' && steps.pw-retry.outcome == 'failure' && steps.classify.outputs.all_cf != 'true'
+        continue-on-error: true
+        timeout-minutes: 9
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-6' }}
+          SLACK_MENTION_USER_IDS: ${{ vars.SLACK_MENTION_USER_IDS }}
+          SLACK_MENTION_USER_ID: ${{ vars.SLACK_MENTION_USER_ID }}
+        run: node scripts/diagnose.mjs
+
+      - name: Fallback Slack alert if diagnose did not complete
+        if: |
+          steps.pw.outcome == 'failure' && steps.pw-retry.outcome == 'failure' &&
+          steps.classify.outputs.all_cf != 'true' &&
+          steps.diag.outcome != 'success'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MENTION_USER_IDS: ${{ vars.SLACK_MENTION_USER_IDS }}
+          SLACK_MENTION_USER_ID: ${{ vars.SLACK_MENTION_USER_ID }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node scripts/notify-diagnose-failed.mjs
+
+      - name: Notify success
+        if: |
+          (steps.pw.outcome == 'success' || steps.pw-retry.outcome == 'success') &&
+          (github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch')
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL_SUCCESS: ${{ secrets.SLACK_WEBHOOK_URL_SUCCESS }}
+          MONITOR_SCOPE: ${{ steps.scope.outputs.grep }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: node scripts/notify-success.mjs
+
+      - uses: actions/upload-artifact@v4
+        if: steps.pw.outcome == 'failure' && steps.pw-retry.outcome == 'failure'
+        with:
+          name: pw-report-${{ github.run_id }}
+          path: |
+            test-results/
+            results.json
+          retention-days: 14
+
+      - name: Fail
+        if: |
+          steps.pw.outcome == 'failure' && steps.pw-retry.outcome == 'failure' &&
+          steps.classify.outputs.all_cf != 'true'
+        run: exit 1
