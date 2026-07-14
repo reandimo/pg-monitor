@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   monitor:
@@ -14,6 +15,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub disables scheduled workflows after 60 days without repo
+      # activity; re-enabling via API resets that timer.
+      - name: Keepalive
+        if: github.event.schedule == '*/30 * * * *'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/monitor.yml/enable"
 
       - uses: actions/setup-node@v4
         with:
